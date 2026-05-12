@@ -99,6 +99,7 @@ struct ublk_queue {
 	struct ublk_io ios[UBLK_QUEUE_DEPTH];
 #define UBLKSRV_QUEUE_STOPPING	(1U << 0)
 #define UBLKSRV_QUEUE_IDLE	(1U << 1)
+#define UBLKSRV_QUEUE_IOCTL_OP	(1U << 2)
 	unsigned state;
 	pid_t tid;
 	pthread_t thread;
@@ -112,6 +113,7 @@ struct ublk_dev {
 	int fds[2];	/* fds[0] points to /dev/ublkcN */
 	int nr_fds;
 	int ctrl_fd;
+	bool ctrl_cmd_ioctl_encode;
 	struct io_uring ring;
 };
 
@@ -221,6 +223,63 @@ static inline void ublk_set_sqe_cmd_op(struct io_uring_sqe *sqe,
         addr[1] = 0;
 }
 
+static inline __u32 ublk_encode_ctrl_cmd_op(struct ublk_dev *dev, __u32 cmd_op)
+{
+#ifdef UBLK_F_CMD_IOCTL_ENCODE
+	if (dev->ctrl_cmd_ioctl_encode) {
+		switch (cmd_op) {
+		case UBLK_CMD_GET_QUEUE_AFFINITY:
+			return _IOR('u', UBLK_CMD_GET_QUEUE_AFFINITY,
+					struct ublksrv_ctrl_cmd);
+		case UBLK_CMD_GET_DEV_INFO:
+			return _IOR('u', UBLK_CMD_GET_DEV_INFO,
+					struct ublksrv_ctrl_cmd);
+		case UBLK_CMD_ADD_DEV:
+			return _IOWR('u', UBLK_CMD_ADD_DEV,
+					struct ublksrv_ctrl_cmd);
+		case UBLK_CMD_DEL_DEV:
+			return _IOWR('u', UBLK_CMD_DEL_DEV,
+					struct ublksrv_ctrl_cmd);
+		case UBLK_CMD_START_DEV:
+			return _IOWR('u', UBLK_CMD_START_DEV,
+					struct ublksrv_ctrl_cmd);
+		case UBLK_CMD_STOP_DEV:
+			return _IOWR('u', UBLK_CMD_STOP_DEV,
+					struct ublksrv_ctrl_cmd);
+		case UBLK_CMD_SET_PARAMS:
+			return _IOWR('u', UBLK_CMD_SET_PARAMS,
+					struct ublksrv_ctrl_cmd);
+		case UBLK_CMD_GET_PARAMS:
+			return _IOR('u', UBLK_CMD_GET_PARAMS,
+					struct ublksrv_ctrl_cmd);
+		case UBLK_CMD_START_USER_RECOVERY:
+			return _IOWR('u', UBLK_CMD_START_USER_RECOVERY,
+					struct ublksrv_ctrl_cmd);
+		case UBLK_CMD_END_USER_RECOVERY:
+			return _IOWR('u', UBLK_CMD_END_USER_RECOVERY,
+					struct ublksrv_ctrl_cmd);
+#ifdef UBLK_CMD_GET_DEV_INFO2
+		case UBLK_CMD_GET_DEV_INFO2:
+			return _IOR('u', UBLK_CMD_GET_DEV_INFO2,
+					struct ublksrv_ctrl_cmd);
+#endif
+		default:
+			break;
+		}
+	}
+#endif
+	return cmd_op;
+}
+
+static inline __u32 ublk_encode_io_cmd_op(struct ublk_queue *q, __u32 cmd_op)
+{
+#ifdef UBLK_F_CMD_IOCTL_ENCODE
+	if (q->state & UBLKSRV_QUEUE_IOCTL_OP)
+		return _IOWR('u', _IOC_NR(cmd_op), struct ublksrv_io_cmd);
+#endif
+	return cmd_op;
+}
+
 static inline int ublk_setup_ring(struct io_uring *r, int depth,
 		int cq_depth, unsigned flags)
 {
@@ -255,12 +314,13 @@ static inline void ublk_ctrl_init_cmd(struct ublk_dev *dev,
 	cmd->dev_id = info->dev_id;
 	cmd->queue_id = -1;
 
-	ublk_set_sqe_cmd_op(sqe, data->cmd_op);
+	ublk_set_sqe_cmd_op(sqe, ublk_encode_ctrl_cmd_op(dev,
+				data->cmd_op));
 
 	io_uring_sqe_set_data(sqe, cmd);
 }
 
-static int __ublk_ctrl_cmd(struct ublk_dev *dev,
+static int __ublk_ctrl_cmd_once(struct ublk_dev *dev,
 		struct ublk_ctrl_cmd_data *data)
 {
 	struct io_uring_sqe *sqe;
@@ -289,6 +349,24 @@ static int __ublk_ctrl_cmd(struct ublk_dev *dev,
 	io_uring_cqe_seen(&dev->ring, cqe);
 
 	return cqe->res;
+}
+
+static int __ublk_ctrl_cmd(struct ublk_dev *dev,
+		struct ublk_ctrl_cmd_data *data)
+{
+	int ret;
+
+	ret = __ublk_ctrl_cmd_once(dev, data);
+#ifdef UBLK_F_CMD_IOCTL_ENCODE
+	if (dev->ctrl_cmd_ioctl_encode &&
+			(ret == -EOPNOTSUPP || ret == -EINVAL)) {
+		dev->ctrl_cmd_ioctl_encode = false;
+		if (data->cmd_op == UBLK_CMD_ADD_DEV)
+			dev->dev_info.flags &= ~UBLK_F_CMD_IOCTL_ENCODE;
+		ret = __ublk_ctrl_cmd_once(dev, data);
+	}
+#endif
+	return ret;
 }
 
 int ublk_ctrl_stop_dev(struct ublk_dev *dev)
@@ -322,6 +400,12 @@ int ublk_ctrl_add_dev(struct ublk_dev *dev)
 		.len = sizeof(struct ublksrv_ctrl_dev_info),
 	};
 
+#ifdef UBLK_F_CMD_IOCTL_ENCODE
+	if (dev->ctrl_cmd_ioctl_encode)
+		dev->dev_info.flags |= UBLK_F_CMD_IOCTL_ENCODE;
+	else
+		dev->dev_info.flags &= ~UBLK_F_CMD_IOCTL_ENCODE;
+#endif
 	return __ublk_ctrl_cmd(dev, &data);
 }
 
@@ -468,6 +552,9 @@ static struct ublk_dev *ublk_ctrl_init()
 		return NULL;
 	}
 	dev->nr_fds = 1;
+#ifdef UBLK_F_CMD_IOCTL_ENCODE
+	dev->ctrl_cmd_ioctl_encode = true;
+#endif
 
 	return dev;
 }
@@ -521,6 +608,10 @@ static int ublk_queue_init(struct ublk_queue *q)
 
 	q->tgt_ops = dev->tgt.ops;
 	q->state = 0;
+#ifdef UBLK_F_CMD_IOCTL_ENCODE
+	if (dev->dev_info.flags & UBLK_F_CMD_IOCTL_ENCODE)
+		q->state |= UBLKSRV_QUEUE_IOCTL_OP;
+#endif
 	q->q_depth = depth;
 	q->cmd_inflight = 0;
 	q->tid = gettid();
@@ -612,6 +703,7 @@ static int ublk_queue_io_cmd(struct ublk_queue *q,
 	struct ublksrv_io_cmd *cmd;
 	struct io_uring_sqe *sqe;
 	unsigned int cmd_op = 0;
+	unsigned int submit_cmd_op;
 	__u64 user_data;
 
 	/* only freed io can be issued */
@@ -640,8 +732,10 @@ static int ublk_queue_io_cmd(struct ublk_queue *q,
 	if (cmd_op == UBLK_IO_COMMIT_AND_FETCH_REQ)
 		cmd->result = io->result;
 
+	submit_cmd_op = ublk_encode_io_cmd_op(q, cmd_op);
+
 	/* These fields should be written once, never change */
-	ublk_set_sqe_cmd_op(sqe, cmd_op);
+	ublk_set_sqe_cmd_op(sqe, submit_cmd_op);
 	sqe->fd		= 0;	/* dev->fds[0] */
 	sqe->opcode	= IORING_OP_URING_CMD;
 	sqe->flags	= IOSQE_FIXED_FILE;
