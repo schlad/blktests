@@ -28,6 +28,7 @@ _cleanup_044() {
 
 requires() {
 	_have_null_blk
+	_have_module_param null_blk memory_backed
 	_have_kernel_option IOSCHED_BFQ
 	_have_fs btrfs
 	_have_program mkfs.btrfs
@@ -42,6 +43,7 @@ test() {
 			completion_nsec=5000000 \
 			submit_queues=1 \
 			hw_queue_depth=8 \
+			memory_backed=1 \
 			size=1024 \
 			power=1; then
 		return 1
