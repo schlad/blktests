@@ -123,11 +123,14 @@ test() {
 	local dmesg_lines_before
 	dmesg_lines_before=$(dmesg | wc -l)
 
-	# Mount triggers caching_thread for each block group.  With nr_requests=1
-	# the caching_threads pile up in blk_mq_get_tag behind each other; the
-	# third thread waits at least 2 * _DM_DELAY_MS ms (6 s) which exceeds
-	# hung_task_timeout (4 s).  No additional IO workload is needed.
-	mount -o space_cache=v2 "$dm_dev" "$MNT"
+	# clear_cache forces btrfs to discard the existing free space tree and
+	# rebuild it from scratch on this mount, starting caching_threads for
+	# every block group simultaneously — exactly what happens when btrfs
+	# mounts a filesystem that was not cleanly unmounted (e.g. kdump).
+	# Without clear_cache, space_cache=v2 considers the tree valid and
+	# never starts caching_threads, so no disk IO is issued and the
+	# blk_mq_get_tag exhaustion cannot be triggered.
+	mount -o space_cache=v2,clear_cache "$dm_dev" "$MNT"
 
 	local elapsed=0 hung=0
 	while (( elapsed < 60 )); do
