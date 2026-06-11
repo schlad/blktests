@@ -113,7 +113,11 @@ test() {
 	# environment: BFQ limits writes to ~75% of nr_requests leaving reads
 	# from caching_thread (unrestricted by BFQ) to compete for the rest.
 	echo bfq > "$dm_queue/scheduler"
-	echo 8 > "$dm_queue/nr_requests"
+	# 4 tags: BFQ caps async writes at ~3, leaving only 1 for sync reads.
+	# With 16+ concurrent caching_thread read bios (one per block group on
+	# a 4 GB filesystem), the first is served and the rest block in
+	# blk_mq_get_tag.
+	echo 4 > "$dm_queue/nr_requests"
 
 	# Mount reads superroot and tree nodes sequentially through dm-delay:
 	# each read takes _DM_DELAY_MS ms but tags are returned promptly.
