@@ -30,12 +30,21 @@ _DM_DELAY_MS=3000
 _cleanup_044() {
 	[[ -n "${ORIG_HUNG_TIMEOUT:-}" ]] && \
 		echo "$ORIG_HUNG_TIMEOUT" > /proc/sys/kernel/hung_task_timeout_secs
+	# Signal fio early but do not wait yet: if fio is stuck in D-state
+	# inside blk_mq_get_tag it cannot receive signals until a tag is freed.
 	[[ -n "${FIO_PID:-}" ]] && kill "$FIO_PID" 2>/dev/null
-	[[ -n "${FIO_PID:-}" ]] && wait "$FIO_PID" 2>/dev/null
 	[[ -n "${MNT:-}" ]] && umount -l "$MNT" 2>/dev/null
 	[[ -n "${MNT:-}" ]] && rm -rf "$MNT"
-	# dm device must be torn down before null_blk can be removed.
+	# Force-remove the dm device before waiting for fio.  This completes
+	# all pending dm-delay IOs with EIO, freeing their tags and unblocking
+	# any kernel threads (caching_thread, btrfs-transacti) or fio jobs
+	# that were stuck in blk_mq_get_tag.
 	dmsetup remove --force "$_DM_NAME" 2>/dev/null
+	# Allow time for dm-delay timers to fire and for btrfs to process the
+	# IO errors before we pull null_blk away.
+	sleep $(( (_DM_DELAY_MS / 1000) + 2 ))
+	# fio can now exit since its blocked IOs have been errored out.
+	[[ -n "${FIO_PID:-}" ]] && wait "$FIO_PID" 2>/dev/null
 	_exit_null_blk
 }
 
