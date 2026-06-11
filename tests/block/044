@@ -115,18 +115,27 @@ test() {
 	echo bfq > "$dm_queue/scheduler"
 	echo 8 > "$dm_queue/nr_requests"
 
-	# With _DM_DELAY_MS=3000 any thread stuck waiting for a tag for more
-	# than 2 seconds cannot be making forward progress.
+	# Mount reads superroot and tree nodes sequentially through dm-delay:
+	# each read takes _DM_DELAY_MS ms but tags are returned promptly.
+	# This is not tag starvation — just a slow device.
+	mount -o space_cache=v2 "$dm_dev" "$MNT"
+
+	# open_ctree sequential reads are done.  Set hung_task_timeout to
+	# _DM_DELAY_MS/1000 + 1 seconds so a single blocked IO no longer
+	# triggers it — only threads stuck indefinitely in blk_mq_get_tag
+	# (no tag available at all) will fire.
 	ORIG_HUNG_TIMEOUT=$(cat /proc/sys/kernel/hung_task_timeout_secs)
-	echo 2 > /proc/sys/kernel/hung_task_timeout_secs
+	echo 4 > /proc/sys/kernel/hung_task_timeout_secs
 
 	local dmesg_lines_before
 	dmesg_lines_before=$(dmesg | wc -l)
 
-	# Mount triggers caching_thread per block group; fio's write pressure
-	# drives btrfs-transacti to run delayed refs — both read btree nodes
-	# and compete for the 8 available request tags on the dm device.
-	mount -o space_cache=v2 "$dm_dev" "$MNT"
+	# fio's async write pressure fills the 8 available tags via BFQ's
+	# async depth (~75% = 6 tags), leaving only 2 for the sync reads
+	# from caching_thread and btrfs-transacti.  With _DM_DELAY_MS=3000
+	# those 6 write tags are held for 3s each; if caching_thread and
+	# btrfs-transacti both need a sync read tag at the same time they
+	# block indefinitely in blk_mq_get_tag.
 	fio --filename="$MNT/workload" --size=128M --bs=4k --rw=randwrite \
 		--ioengine=sync --numjobs=4 --name=txpressure \
 		--runtime=20 --time_based >> "$FULL" 2>&1 &
@@ -138,7 +147,7 @@ test() {
 			break
 		fi
 		if dmesg | tail -n +"$((dmesg_lines_before + 1))" | \
-				grep -q "Workqueue: btrfs-cache"; then
+				grep -q "blk_mq_get_tag"; then
 			hung=1
 			break
 		fi
