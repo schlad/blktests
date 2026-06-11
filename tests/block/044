@@ -10,11 +10,22 @@
 #
 # Observed on Intel C600 SAS (isci) hardware in a kdump kernel,
 # kernel 6.4.0-150700.53.60-default.
+#
+# A dm-delay device is layered over null_blk to hold each IO in flight for
+# _DM_DELAY_MS milliseconds, simulating the slow or stuck isci controller.
+# Setup (mkfs, pre-populate) runs directly against null_blk without the
+# delay so the test completes in reasonable time.
 
 . tests/block/rc
 . common/null_blk
 
 DESCRIPTION="btrfs free space caching tag starvation under BFQ with shallow queue"
+
+_DM_NAME=blktests_044_delay
+# IO delay applied via dm-delay.  Must exceed hung_task_timeout_secs (set to
+# 2 below) so that any thread stuck waiting for a tag is caught by the hung
+# task detector before a completion arrives.
+_DM_DELAY_MS=3000
 
 _cleanup_044() {
 	[[ -n "${ORIG_HUNG_TIMEOUT:-}" ]] && \
@@ -23,6 +34,8 @@ _cleanup_044() {
 	[[ -n "${FIO_PID:-}" ]] && wait "$FIO_PID" 2>/dev/null
 	[[ -n "${MNT:-}" ]] && umount -l "$MNT" 2>/dev/null
 	[[ -n "${MNT:-}" ]] && rm -rf "$MNT"
+	# dm device must be torn down before null_blk can be removed.
+	dmsetup remove --force "$_DM_NAME" 2>/dev/null
 	_exit_null_blk
 }
 
@@ -33,16 +46,20 @@ requires() {
 	_have_fs btrfs
 	_have_program mkfs.btrfs
 	_have_fio
+	_have_program dmsetup
+	_have_driver dm_delay
 }
 
 test() {
 	echo "Running ${TEST_NAME}"
 
+	# null_blk: large queue depth — the bottleneck is the dm-delay device
+	# sitting on top, not the underlying device.
 	if ! _configure_null_blk nullb1 \
 			irqmode=2 \
 			completion_nsec=5000000 \
 			submit_queues=1 \
-			hw_queue_depth=8 \
+			hw_queue_depth=64 \
 			memory_backed=1 \
 			size=1024 \
 			power=1; then
@@ -56,8 +73,9 @@ test() {
 
 	mkfs.btrfs -f "$dev" >> "$FULL" 2>&1
 
-	# Pre-populate and fragment free space so caching_thread has real work
-	# (multiple bio reads of the free space tree) on the next mount.
+	# Pre-populate and fragment free space directly on null_blk (no delay)
+	# so caching_thread has real work — multiple bio reads of the free space
+	# tree — on the next mount.
 	mount -o space_cache=v2 "$dev" "$MNT"
 	local i
 	for i in $(seq 1 500); do
@@ -69,28 +87,44 @@ test() {
 	sync
 	umount "$MNT"
 
-	# Shallow queue + BFQ to simulate the isci kdump environment.
-	echo bfq > /sys/block/nullb1/queue/scheduler
-	echo 8 > /sys/block/nullb1/queue/nr_requests
+	# Layer dm-delay over null_blk.  Every IO through this device takes
+	# _DM_DELAY_MS ms to complete, keeping request tags in flight long
+	# enough for the hung task detector to fire.
+	local sectors
+	sectors=$(blockdev --getsz "$dev")
+	echo "0 $sectors delay $dev 0 $_DM_DELAY_MS" | \
+		dmsetup create "$_DM_NAME" >> "$FULL" 2>&1
 
-	# Shorten hung task timeout so the kernel detects a deadlock quickly.
+	local dm_dev=/dev/mapper/$_DM_NAME
+	local dm_minor
+	dm_minor=$(dmsetup info -c --noheadings -o minor "$_DM_NAME")
+	local dm_queue=/sys/block/dm-${dm_minor}/queue
+
+	# Shallow queue + BFQ on the dm device to reproduce the isci kdump
+	# environment: BFQ limits writes to ~75% of nr_requests leaving reads
+	# from caching_thread (unrestricted by BFQ) to compete for the rest.
+	echo bfq > "$dm_queue/scheduler"
+	echo 8 > "$dm_queue/nr_requests"
+
+	# With _DM_DELAY_MS=3000 any thread stuck waiting for a tag for more
+	# than 2 seconds cannot be making forward progress.
 	ORIG_HUNG_TIMEOUT=$(cat /proc/sys/kernel/hung_task_timeout_secs)
-	echo 20 > /proc/sys/kernel/hung_task_timeout_secs
+	echo 2 > /proc/sys/kernel/hung_task_timeout_secs
 
 	local dmesg_lines_before
 	dmesg_lines_before=$(dmesg | wc -l)
 
-	# Remount and immediately apply transaction pressure; the race is between
-	# caching_thread warming up the free space tree and btrfs-transacti
-	# committing dirty block groups, both competing for request tags.
-	mount -o space_cache=v2 "$dev" "$MNT"
+	# Mount triggers caching_thread per block group; fio's write pressure
+	# drives btrfs-transacti to run delayed refs — both read btree nodes
+	# and compete for the 8 available request tags on the dm device.
+	mount -o space_cache=v2 "$dm_dev" "$MNT"
 	fio --filename="$MNT/workload" --size=128M --bs=4k --rw=randwrite \
 		--ioengine=sync --numjobs=4 --name=txpressure \
 		--runtime=20 --time_based >> "$FULL" 2>&1 &
 	FIO_PID=$!
 
 	local elapsed=0 hung=0
-	while (( elapsed < 35 )); do
+	while (( elapsed < 60 )); do
 		if ! kill -0 "$FIO_PID" 2>/dev/null; then
 			break
 		fi
