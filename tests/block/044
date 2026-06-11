@@ -22,14 +22,17 @@
 DESCRIPTION="btrfs free space caching tag starvation under BFQ with shallow queue"
 
 _DM_NAME=blktests_044_delay
-# IO delay applied via dm-delay.  Must exceed hung_task_timeout_secs (set to
-# 2 below) so that any thread stuck waiting for a tag is caught by the hung
-# task detector before a completion arrives.
+# IO delay applied via dm-delay.  A single blocked IO takes _DM_DELAY_MS ms
+# (3 s) which is just below hung_task_timeout_secs (4 s), so the mount
+# process reading tree nodes sequentially does not produce false positives.
+# A caching_thread waiting behind two others waits 2 * 3 s = 6 s > 4 s and
+# is correctly caught by the hung task detector.
 _DM_DELAY_MS=3000
 
 _cleanup_044() {
 	[[ -n "${ORIG_HUNG_TIMEOUT:-}" ]] && \
 		echo "$ORIG_HUNG_TIMEOUT" > /proc/sys/kernel/hung_task_timeout_secs
+	[[ -n "${FIO_PID:-}" ]] && kill "$FIO_PID" 2>/dev/null
 	[[ -n "${MNT:-}" ]] && umount -l "$MNT" 2>/dev/null
 	[[ -n "${MNT:-}" ]] && rm -rf "$MNT"
 	# Force-remove errors all pending dm-delay IOs immediately, freeing
@@ -46,6 +49,7 @@ requires() {
 	_have_kernel_option IOSCHED_BFQ
 	_have_fs btrfs
 	_have_program mkfs.btrfs
+	_have_fio
 	_have_program dmsetup
 	_have_driver dm_delay
 }
@@ -132,6 +136,15 @@ test() {
 	# blk_mq_get_tag exhaustion cannot be triggered.
 	mount -o space_cache=v2,clear_cache "$dm_dev" "$MNT"
 
+	# O_DIRECT writes bypass page cache and hit the block layer immediately,
+	# consuming the single available tag.  This creates the third concurrent
+	# consumer (fio write + rebuild read + btrfs-transacti read) needed for
+	# the third waiter to exceed hung_task_timeout (waits 2 * _DM_DELAY_MS).
+	fio --filename="$MNT/workload" --size=64M --bs=4k --rw=randwrite \
+		--ioengine=sync --direct=1 --numjobs=4 --name=pressure \
+		--runtime=30 --time_based >> "$FULL" 2>&1 &
+	FIO_PID=$!
+
 	local elapsed=0 hung=0
 	while (( elapsed < 60 )); do
 		if dmesg | tail -n +"$((dmesg_lines_before + 1))" | \
@@ -141,7 +154,11 @@ test() {
 		fi
 		sleep 2
 		(( elapsed += 2 ))
+		# fio exiting is not a detection signal — the loop runs for the
+		# full 60 s window regardless.
 	done
+	[[ -n "${FIO_PID:-}" ]] && kill "$FIO_PID" 2>/dev/null
+	wait "${FIO_PID:-}" 2>/dev/null
 
 	if (( hung )); then
 		echo "FAIL: btrfs tag starvation deadlock detected in dmesg"
