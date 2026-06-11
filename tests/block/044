@@ -1,0 +1,110 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2026 Sebastian Chlad <sebastianchlad@gmail.com>
+#
+# Regression test for blk_mq tag starvation triggered by btrfs under BFQ.
+# When btrfs mounts a device with a shallow request queue and BFQ enabled,
+# caching_thread (reading the v2 free space tree) and btrfs-transacti
+# (committing dirty block groups) can simultaneously exhaust all available
+# request tags and block indefinitely in blk_mq_get_tag.
+#
+# Observed on Intel C600 SAS (isci) hardware in a kdump kernel,
+# kernel 6.4.0-150700.53.60-default.
+
+. tests/block/rc
+. common/null_blk
+
+DESCRIPTION="btrfs free space caching tag starvation under BFQ with shallow queue"
+
+_cleanup_044() {
+	[[ -n "${ORIG_HUNG_TIMEOUT:-}" ]] && \
+		echo "$ORIG_HUNG_TIMEOUT" > /proc/sys/kernel/hung_task_timeout_secs
+	[[ -n "${FIO_PID:-}" ]] && kill "$FIO_PID" 2>/dev/null
+	[[ -n "${FIO_PID:-}" ]] && wait "$FIO_PID" 2>/dev/null
+	[[ -n "${MNT:-}" ]] && umount -l "$MNT" 2>/dev/null
+	[[ -n "${MNT:-}" ]] && rm -rf "$MNT"
+	_exit_null_blk
+}
+
+requires() {
+	_have_null_blk
+	_have_kernel_option IOSCHED_BFQ
+	_have_fs btrfs
+	_have_program mkfs.btrfs
+	_have_fio
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	if ! _configure_null_blk nullb1 \
+			irqmode=2 \
+			completion_nsec=5000000 \
+			submit_queues=1 \
+			hw_queue_depth=8 \
+			size=1024 \
+			power=1; then
+		return 1
+	fi
+
+	_register_test_cleanup _cleanup_044
+
+	local dev=/dev/nullb1
+	MNT=$(mktemp -d)
+
+	mkfs.btrfs -f "$dev" >> "$FULL" 2>&1
+
+	# Pre-populate and fragment free space so caching_thread has real work
+	# (multiple bio reads of the free space tree) on the next mount.
+	mount -o space_cache=v2 "$dev" "$MNT"
+	local i
+	for i in $(seq 1 500); do
+		dd if=/dev/zero of="$MNT/f$i" bs=4k count=64 2>/dev/null
+	done
+	for i in $(seq 2 2 500); do
+		rm -f "$MNT/f$i"
+	done
+	sync
+	umount "$MNT"
+
+	# Shallow queue + BFQ to simulate the isci kdump environment.
+	echo bfq > /sys/block/nullb1/queue/scheduler
+	echo 8 > /sys/block/nullb1/queue/nr_requests
+
+	# Shorten hung task timeout so the kernel detects a deadlock quickly.
+	ORIG_HUNG_TIMEOUT=$(cat /proc/sys/kernel/hung_task_timeout_secs)
+	echo 20 > /proc/sys/kernel/hung_task_timeout_secs
+
+	local dmesg_lines_before
+	dmesg_lines_before=$(dmesg | wc -l)
+
+	# Remount and immediately apply transaction pressure; the race is between
+	# caching_thread warming up the free space tree and btrfs-transacti
+	# committing dirty block groups, both competing for request tags.
+	mount -o space_cache=v2 "$dev" "$MNT"
+	fio --filename="$MNT/workload" --size=128M --bs=4k --rw=randwrite \
+		--ioengine=sync --numjobs=4 --name=txpressure \
+		--runtime=20 --time_based >> "$FULL" 2>&1 &
+	FIO_PID=$!
+
+	local elapsed=0 hung=0
+	while (( elapsed < 35 )); do
+		if ! kill -0 "$FIO_PID" 2>/dev/null; then
+			break
+		fi
+		if dmesg | tail -n +"$((dmesg_lines_before + 1))" | \
+				grep -q "Workqueue: btrfs-cache"; then
+			hung=1
+			break
+		fi
+		sleep 2
+		(( elapsed += 2 ))
+	done
+
+	if (( hung )); then
+		echo "FAIL: btrfs tag starvation deadlock detected in dmesg"
+		return 1
+	fi
+
+	echo "Test complete"
+}
