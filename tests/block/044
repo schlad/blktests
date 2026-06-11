@@ -30,21 +30,13 @@ _DM_DELAY_MS=3000
 _cleanup_044() {
 	[[ -n "${ORIG_HUNG_TIMEOUT:-}" ]] && \
 		echo "$ORIG_HUNG_TIMEOUT" > /proc/sys/kernel/hung_task_timeout_secs
-	# Signal fio early but do not wait yet: if fio is stuck in D-state
-	# inside blk_mq_get_tag it cannot receive signals until a tag is freed.
-	[[ -n "${FIO_PID:-}" ]] && kill "$FIO_PID" 2>/dev/null
 	[[ -n "${MNT:-}" ]] && umount -l "$MNT" 2>/dev/null
 	[[ -n "${MNT:-}" ]] && rm -rf "$MNT"
-	# Force-remove the dm device before waiting for fio.  This completes
-	# all pending dm-delay IOs with EIO, freeing their tags and unblocking
-	# any kernel threads (caching_thread, btrfs-transacti) or fio jobs
-	# that were stuck in blk_mq_get_tag.
+	# Force-remove errors all pending dm-delay IOs immediately, freeing
+	# their tags and unblocking any caching_thread stuck in blk_mq_get_tag.
 	dmsetup remove --force "$_DM_NAME" 2>/dev/null
-	# Allow time for dm-delay timers to fire and for btrfs to process the
-	# IO errors before we pull null_blk away.
+	# Let btrfs process the EIO responses before pulling null_blk away.
 	sleep $(( (_DM_DELAY_MS / 1000) + 2 ))
-	# fio can now exit since its blocked IOs have been errored out.
-	[[ -n "${FIO_PID:-}" ]] && wait "$FIO_PID" 2>/dev/null
 	_exit_null_blk
 }
 
@@ -54,7 +46,6 @@ requires() {
 	_have_kernel_option IOSCHED_BFQ
 	_have_fs btrfs
 	_have_program mkfs.btrfs
-	_have_fio
 	_have_program dmsetup
 	_have_driver dm_delay
 }
@@ -132,20 +123,14 @@ test() {
 	local dmesg_lines_before
 	dmesg_lines_before=$(dmesg | wc -l)
 
+	# Mount triggers caching_thread for each block group.  With nr_requests=1
+	# the caching_threads pile up in blk_mq_get_tag behind each other; the
+	# third thread waits at least 2 * _DM_DELAY_MS ms (6 s) which exceeds
+	# hung_task_timeout (4 s).  No additional IO workload is needed.
 	mount -o space_cache=v2 "$dm_dev" "$MNT"
-
-	# fio adds transaction-commit pressure (btrfs-transacti reads) on top
-	# of the caching_thread reads already saturating the single tag.
-	fio --filename="$MNT/workload" --size=128M --bs=4k --rw=randwrite \
-		--ioengine=sync --numjobs=4 --name=txpressure \
-		--runtime=20 --time_based >> "$FULL" 2>&1 &
-	FIO_PID=$!
 
 	local elapsed=0 hung=0
 	while (( elapsed < 60 )); do
-		if ! kill -0 "$FIO_PID" 2>/dev/null; then
-			break
-		fi
 		if dmesg | tail -n +"$((dmesg_lines_before + 1))" | \
 				grep -q "blk_mq_get_tag"; then
 			hung=1
