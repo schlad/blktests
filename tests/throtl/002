@@ -22,21 +22,21 @@ test() {
 	local iops=256
 
 	page_size=$(_get_page_size)
-	echo "page_size=${page_size}"
+	echo "page_size=${page_size}" >&2
 
 	if ! _set_up_throtl --sector_size "${page_size}"; then
 		return 1;
 	fi
 
 	io_size_kb=$(($(_throtl_get_max_io_size) * 1024))
-	echo "io_size_kb=${io_size_kb} (max_io_size from device)"
+	echo "io_size_kb=${io_size_kb} (max_io_size from device)" >&2
 	if [ "${io_size_kb}" -gt "${page_size}" ]; then
 		_throtl_set_max_io_size $((page_size / 1024))
-		echo "capped max_io_size to $((page_size / 1024)) kb"
+		echo "capped max_io_size to $((page_size / 1024)) kb" >&2
 	fi
 	block_size=$((iops * page_size))
-	echo "block_size=${block_size} (iops=${iops} * page_size=${page_size})"
-	echo "max_sectors passed to nullblk=$((page_size / 512))"
+	echo "block_size=${block_size} (iops=${iops} * page_size=${page_size})" >&2
+	echo "max_sectors passed to nullblk=$((page_size / 512))" >&2
 
 	_throtl_set_limits wiops="${iops}"
 	_throtl_test_io write "${block_size}" 1
