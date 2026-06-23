@@ -14,7 +14,7 @@ group_requires() {
 }
 
 _stacked_atomic_test_requires() {
-	_have_kver 6 14 0
+	_have_kver 6 12 0
 	_have_xfs_io_atomic_write
 	_have_driver raid0
 	_have_driver raid1
