@@ -1,0 +1,9 @@
+Running nvme/069
+TEST 1 - Verify atomic write properties are propagated through nvmet - pass
+TEST 2 - Verify sysfs atomic attribute ordering - pass
+TEST 3 - Verify statx atomic_write_unit_max_bytes - pass
+TEST 4 - Verify statx atomic_write_unit_min_bytes - pass
+TEST 5 - pwritev2 RWF_ATOMIC at atomic_write_unit_min_bytes - pass
+TEST 6 - pwritev2 RWF_ATOMIC at atomic_write_unit_max_bytes - pass
+TEST 7 - pwritev2 RWF_ATOMIC at atomic_write_unit_max_bytes + LBS should fail - pass
+Test complete

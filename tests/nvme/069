@@ -1,0 +1,150 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2026 SUSE LLC
+#
+# Test NVMe atomic writes over nvmet-loop with a scsi_debug backing device.
+# Verifies that atomic write properties are correctly propagated through the
+# nvmet stack to the block layer sysfs attributes and that atomic writes work.
+
+. tests/nvme/rc
+. common/scsi_debug
+. common/xfs
+
+DESCRIPTION="test NVMe atomic writes over nvmet-loop"
+QUICK=1
+
+requires() {
+	_nvme_requires
+	_have_scsi_debug
+	_have_xfs_io_atomic_write
+	_require_nvme_trtype_is_fabrics
+}
+
+set_conditions() {
+	_set_nvme_trtype "$@"
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	local scsi_debug_params=(
+		delay=0
+		atomic_wr=1
+		num_tgts=1
+		add_host=1
+		per_host_store=1
+		dev_size_mb=16
+	)
+
+	if ! _configure_scsi_debug "${scsi_debug_params[@]}"; then
+		return 1
+	fi
+
+	local backing_dev="/dev/${SCSI_DEBUG_DEVICES[0]}"
+
+	_setup_nvmet
+	_nvmet_target_setup --blkdev none
+	_create_nvmet_ns --blkdev "${backing_dev}" --uuid "${def_subsys_uuid}" > /dev/null
+	_nvme_connect_subsys
+
+	local ns
+	ns=$(_find_nvme_ns "${def_subsys_uuid}")
+	if [[ -z "${ns}" ]]; then
+		echo "could not find nvmet namespace"
+		_nvme_disconnect_subsys > /dev/null
+		_nvmet_target_cleanup --blkdev none
+		_exit_scsi_debug
+		return 1
+	fi
+
+	local ctrl_dev queue_path
+	ctrl_dev="${ns%n*}"
+	queue_path="/sys/block/${ns}/queue"
+
+	local sysfs_logical_block_size sysfs_max_hw_sectors_kb max_hw_bytes
+	local sysfs_atomic_max_bytes sysfs_atomic_unit_max_bytes sysfs_atomic_unit_min_bytes
+
+	sysfs_logical_block_size=$(cat "${queue_path}/logical_block_size")
+	sysfs_max_hw_sectors_kb=$(cat "${queue_path}/max_hw_sectors_kb")
+	max_hw_bytes=$(( sysfs_max_hw_sectors_kb * 1024 ))
+	sysfs_atomic_max_bytes=$(cat "${queue_path}/atomic_write_max_bytes")
+	sysfs_atomic_unit_max_bytes=$(cat "${queue_path}/atomic_write_unit_max_bytes")
+	sysfs_atomic_unit_min_bytes=$(cat "${queue_path}/atomic_write_unit_min_bytes")
+
+	local test_desc
+
+	test_desc="TEST 1 - Verify atomic write properties are propagated through nvmet"
+	if [[ "${sysfs_atomic_unit_max_bytes}" -gt 0 &&
+	      "${sysfs_atomic_unit_min_bytes}" -gt 0 ]]; then
+		echo "${test_desc} - pass"
+	else
+		echo "${test_desc} - fail atomic_write_unit_max_bytes=${sysfs_atomic_unit_max_bytes}" \
+			"atomic_write_unit_min_bytes=${sysfs_atomic_unit_min_bytes}"
+		_nvme_disconnect_subsys > /dev/null
+		_nvmet_target_cleanup --blkdev none
+		_exit_scsi_debug
+		echo "Test complete"
+		return 0
+	fi
+
+	test_desc="TEST 2 - Verify sysfs atomic attribute ordering"
+	if [[ "${max_hw_bytes}" -ge "${sysfs_atomic_max_bytes}" ]] &&
+	   [[ "${sysfs_atomic_max_bytes}" -ge "${sysfs_atomic_unit_max_bytes}" ]] &&
+	   [[ "${sysfs_atomic_unit_max_bytes}" -ge "${sysfs_atomic_unit_min_bytes}" ]]; then
+		echo "${test_desc} - pass"
+	else
+		echo "${test_desc} - fail max_hw=${max_hw_bytes}" \
+			"atomic_max=${sysfs_atomic_max_bytes}" \
+			"unit_max=${sysfs_atomic_unit_max_bytes}" \
+			"unit_min=${sysfs_atomic_unit_min_bytes}"
+	fi
+
+	test_desc="TEST 3 - Verify statx atomic_write_unit_max_bytes"
+	local statx_val
+	statx_val=$(run_xfs_io_xstat /dev/"${ns}" "stat.atomic_write_unit_max")
+	if [[ "${sysfs_atomic_unit_max_bytes}" = "${statx_val}" ]]; then
+		echo "${test_desc} - pass"
+	else
+		echo "${test_desc} - fail statx=${statx_val} sysfs=${sysfs_atomic_unit_max_bytes}"
+	fi
+
+	test_desc="TEST 4 - Verify statx atomic_write_unit_min_bytes"
+	statx_val=$(run_xfs_io_xstat /dev/"${ns}" "stat.atomic_write_unit_min")
+	if [[ "${sysfs_atomic_unit_min_bytes}" = "${statx_val}" ]]; then
+		echo "${test_desc} - pass"
+	else
+		echo "${test_desc} - fail statx=${statx_val} sysfs=${sysfs_atomic_unit_min_bytes}"
+	fi
+
+	test_desc="TEST 5 - pwritev2 RWF_ATOMIC at atomic_write_unit_min_bytes"
+	local bytes_written
+	bytes_written=$(run_xfs_io_pwritev2_atomic /dev/"${ns}" "${sysfs_atomic_unit_min_bytes}")
+	if [[ "${bytes_written}" = "${sysfs_atomic_unit_min_bytes}" ]]; then
+		echo "${test_desc} - pass"
+	else
+		echo "${test_desc} - fail bytes_written=${bytes_written} expected=${sysfs_atomic_unit_min_bytes}"
+	fi
+
+	test_desc="TEST 6 - pwritev2 RWF_ATOMIC at atomic_write_unit_max_bytes"
+	bytes_written=$(run_xfs_io_pwritev2_atomic /dev/"${ns}" "${sysfs_atomic_unit_max_bytes}")
+	if [[ "${bytes_written}" = "${sysfs_atomic_unit_max_bytes}" ]]; then
+		echo "${test_desc} - pass"
+	else
+		echo "${test_desc} - fail bytes_written=${bytes_written} expected=${sysfs_atomic_unit_max_bytes}"
+	fi
+
+	test_desc="TEST 7 - pwritev2 RWF_ATOMIC at atomic_write_unit_max_bytes + LBS should fail"
+	local bytes_to_write=$(( sysfs_atomic_unit_max_bytes + sysfs_logical_block_size ))
+	bytes_written=$(run_xfs_io_pwritev2_atomic /dev/"${ns}" "${bytes_to_write}" 2>/dev/null)
+	if [[ "${bytes_written}" = "" ]]; then
+		echo "${test_desc} - pass"
+	else
+		echo "${test_desc} - fail bytes_written=${bytes_written}"
+	fi
+
+	_nvme_disconnect_subsys > /dev/null
+	_nvmet_target_cleanup --blkdev none
+	_exit_scsi_debug
+
+	echo "Test complete"
+}
