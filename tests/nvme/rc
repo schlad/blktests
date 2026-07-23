@@ -107,6 +107,26 @@ _require_nvme_cli_auth() {
 	return 0
 }
 
+_require_kernel_dhchap_keyring() {
+	local probekey
+	local key
+
+	probekey="$(nvme gen-dhchap-key -n nvmf-test-subsys --hmac=1 2> /dev/null)"
+	if [ -z "$probekey" ] ; then
+		SKIP_REASONS+=("nvme gen-dhchap-key failed")
+		return 1
+	fi
+
+	key="$(keyctl add dhchap blktests-dhchap-probe "${probekey}" @p 2> /dev/null)"
+	if [ -z "$key" ] ; then
+		SKIP_REASONS+=("kernel does not support the dhchap key type")
+		return 1
+	fi
+
+	keyctl unlink "${key}" @p > /dev/null 2>&1
+	return 0
+}
+
 _require_nvme_cli_tls() {
 	if ! nvme gen-tls-key --subsysnqn nvmf-test-subsys > /dev/null 2>&1; then
 		SKIP_REASONS+=("nvme gen-tls-key command missing")

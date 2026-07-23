@@ -19,6 +19,7 @@ requires() {
 	_require_nvme_trtype_is_fabrics
 	_require_nvme_cli_auth
 	_have_driver dh_generic
+	_require_kernel_dhchap_keyring
 }
 
 set_conditions() {
