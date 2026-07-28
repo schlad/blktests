@@ -1,0 +1,128 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2026
+#
+# Attempt to reproduce a md/raid1 write-vs-recovery race that was
+# observed as a NULL pointer dereference in wait_for_serialization(),
+# called from raid1_write_request(), when a write races a
+# fail -> remove -> add -> recovery transition on a RAID 1 array while
+# a filesystem's background inode-table zeroing (ext4lazyinit) and/or
+# other concurrent I/O is still in flight.
+#
+# This mirrors the "Test 2: RAID 1" portion of the qam/mdadm.sh script
+# used by the openQA mdadm test (tests/console/mdadm.pm in
+# os-autoinst-distri-opensuse), adapted to use real block devices via
+# TEST_DEV_ARRAY instead of loop-over-file: real devices can't be
+# destroyed and recreated the way a loop backing file can, so we
+# fail/remove/re-add the *same* device instead, which still drives the
+# same md recovery path (mdadm --add of a non-member device is treated
+# as a spare and triggers recovery either way).
+#
+# NOTE: this is a race condition reproducer, not a deterministic
+# regression test. A clean run does not prove the bug is fixed - it may
+# simply mean the race window was missed this time. No explicit check
+# is needed in this script for the actual crash: blktests' own dmesg
+# scan (BUG:/Oops:/WARNING:/general protection fault:/etc, see
+# _check_dmesg() in ./check) is what fails this test if the kernel
+# splats during the run.
+
+. tests/md/rc
+
+DESCRIPTION="reproduce raid1 write-vs-recovery race with concurrent I/O on ext4"
+
+requires() {
+	_have_driver raid1
+	_have_fs ext4
+	_have_program mkfs.ext4
+}
+
+device_requires() {
+	_require_test_dev_size 1g
+}
+
+test_device_array() {
+	echo "Running ${TEST_NAME}"
+
+	if [[ ${#TEST_DEV_ARRAY[@]} -lt 2 ]]; then
+		SKIP_REASONS+=("requires at least 2 test devices")
+		return 1
+	fi
+
+	local mddev="/dev/md/blktests_md"
+	local mnt="$TMPDIR/mnt"
+	local devs=("${TEST_DEV_ARRAY[0]}" "${TEST_DEV_ARRAY[1]}")
+	local fail_dev="${TEST_DEV_ARRAY[1]}"
+	local writer_pid=""
+	local count
+
+	# Use a 3rd device if available, closer to the 3-way mirror in the
+	# original qam/mdadm.sh; otherwise fall back to a 2-way mirror.
+	if [[ ${#TEST_DEV_ARRAY[@]} -ge 3 ]]; then
+		devs+=("${TEST_DEV_ARRAY[2]}")
+	fi
+
+	mkdir -p "$mnt"
+
+	mdadm --create --run --force --quiet "$mddev" \
+		--level=1 --raid-devices="${#devs[@]}" --bitmap=internal \
+		"${devs[@]}"
+	udevadm settle
+
+	if ! grep -q "active raid1" /proc/mdstat; then
+		echo "array is not active raid1"
+		cat /proc/mdstat
+	fi
+
+	# Wait for the initial resync to finish so the crash we're chasing
+	# is the fail/recovery race below, not the initial one.
+	mdadm --wait "$mddev"
+
+	# lazy_itable_init=1 is the mke2fs default: the kernel's
+	# ext4lazyinit thread zeroes inode table blocks asynchronously
+	# after mount - this is the actual writer that crashed originally.
+	mkfs.ext4 -q -F "$mddev"
+	mount "$mddev" "$mnt"
+
+	# Keep additional writes landing on the array via O_DIRECT so the
+	# write path stays busy regardless of how long ext4lazyinit takes,
+	# through the whole fail/remove/add/recovery sequence below.
+	(
+		while :; do
+			dd if=/dev/urandom of="$mnt/writer.dat" bs=1M count=8 \
+				oflag=direct status=none 2>/dev/null
+		done
+	) &
+	writer_pid=$!
+
+	# --quiet does not suppress --fail/--remove/--add confirmation
+	# messages (only --create/--assemble/--stop honor it), so redirect
+	# explicitly to keep output deterministic.
+	mdadm --quiet "$mddev" --fail "$fail_dev" >/dev/null 2>&1
+
+	count=0
+	until mdadm --detail "$mddev" | grep -q removed; do
+		sleep 1
+		count=$((count + 1))
+		if ((count >= 20)); then
+			echo "timed out waiting for faulty device to be removed"
+			break
+		fi
+	done
+
+	mdadm --quiet "$mddev" --remove "$fail_dev" >/dev/null 2>&1
+	mdadm --quiet "$mddev" --add "$fail_dev" >/dev/null 2>&1
+
+	# Give recovery a moment to start and race the writer; the original
+	# crash landed within ~2s of --fail and ~24ms of recovery starting.
+	sleep 5
+
+	if [[ -n "$writer_pid" ]]; then
+		kill "$writer_pid" 2>/dev/null
+		wait "$writer_pid" 2>/dev/null
+	fi
+
+	umount "$mnt" 2>/dev/null
+	mdadm --quiet --stop "$mddev" >/dev/null 2>&1
+
+	echo "Test complete"
+}
