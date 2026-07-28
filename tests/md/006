@@ -1,0 +1,76 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2026
+#
+# Create a RAID 1 array on real block devices (e.g. QEMU-attached scratch
+# disks provided via TEST_DEVS), put an ext4 filesystem on top, write data,
+# and verify it survives an unmount/stop/reassemble/mount cycle.
+#
+# Unlike md/005 (brd-backed, no filesystem), this exercises real device
+# I/O and a filesystem on top of the array, closer to how these arrays
+# are actually used and to the loop+ext4 setup that has been seen to
+# expose md/raid1 write-vs-recovery races.
+
+. tests/md/rc
+
+DESCRIPTION="create a RAID 1 array with an ext4 filesystem on real block devices"
+QUICK=1
+
+requires() {
+	_have_driver raid1
+	_have_fs ext4
+	_have_program mkfs.ext4
+}
+
+device_requires() {
+	_require_test_dev_size 512m
+}
+
+test_device_array() {
+	echo "Running ${TEST_NAME}"
+
+	if [[ ${#TEST_DEV_ARRAY[@]} -lt 2 ]]; then
+		SKIP_REASONS+=("requires at least 2 test devices")
+		return 1
+	fi
+
+	local dev1="${TEST_DEV_ARRAY[0]}"
+	local dev2="${TEST_DEV_ARRAY[1]}"
+	local mnt="$TMPDIR/mnt"
+	mkdir -p "$mnt"
+
+	mdadm --create --run --quiet /dev/md/blktests_md \
+		--level=1 --raid-devices=2 --assume-clean "$dev1" "$dev2"
+	udevadm settle
+
+	if ! grep -q "active raid1" /proc/mdstat; then
+		echo "array is not active raid1"
+		cat /proc/mdstat
+	fi
+
+	mkfs.ext4 -q -F /dev/md/blktests_md
+	mount /dev/md/blktests_md "$mnt"
+
+	dd if=/dev/urandom of="$mnt/testfile" bs=1M count=64 status=none
+	sync
+
+	local before
+	before="$(md5sum "$mnt/testfile" | cut -d' ' -f1)"
+
+	umount "$mnt"
+	mdadm --quiet --stop /dev/md/blktests_md
+
+	mdadm --quiet --assemble /dev/md/blktests_md "$dev1" "$dev2"
+	mount /dev/md/blktests_md "$mnt"
+
+	local after
+	after="$(md5sum "$mnt/testfile" | cut -d' ' -f1)"
+	if [[ "$before" != "$after" ]]; then
+		echo "data mismatch after reassembly: $before != $after"
+	fi
+
+	umount "$mnt"
+	mdadm --quiet --stop /dev/md/blktests_md
+
+	echo "Test complete"
+}
