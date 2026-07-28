@@ -1,0 +1,47 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2026
+#
+# Basic sanity test: create a RAID 1 (mirror) array on top of two brd
+# (ram disk) devices and verify it comes up active, then tear it down.
+
+. tests/md/rc
+. common/brd
+
+DESCRIPTION="create a RAID 1 array and verify it is active"
+QUICK=1
+
+requires() {
+	_have_driver raid1
+	_have_brd
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	if ! _init_brd rd_size=524288 rd_nr=2; then
+		echo "failed to init brd devices"
+		return 1
+	fi
+
+	mdadm --create --run --quiet /dev/md/blktests_md \
+		--level=1 --raid-devices=2 --assume-clean \
+		/dev/ram0 /dev/ram1
+
+	udevadm settle
+
+	if ! grep -q "active raid1" /proc/mdstat; then
+		echo "array is not active raid1"
+		cat /proc/mdstat
+	fi
+
+	if ! mdadm --detail /dev/md/blktests_md | grep -q "State :.*clean"; then
+		echo "array did not reach clean state"
+		mdadm --detail /dev/md/blktests_md
+	fi
+
+	mdadm --quiet --stop /dev/md/blktests_md >/dev/null 2>&1
+	_cleanup_brd
+
+	echo "Test complete"
+}
