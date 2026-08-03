@@ -1,0 +1,61 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2026 Sebastian Chlad, SUSE
+#
+# Basic sanity test: RAID 0, 1, 5, 6, 10. For each defined or available
+# raid level, create an array on block devices provided via
+# TEST_CASE_DEV_ARRAY, verify it comes up as the expected raid level
+# and reaches a healthy state, then write to it with fio, then tear it
+# down.
+
+. tests/md/rc
+
+DESCRIPTION="sanity test for RAID 0/1/5/6/10 on defined block devices"
+QUICK=1
+
+requires() {
+	_have_fio
+	_require_md_raid
+}
+
+device_requires() {
+	_require_test_dev_size 512m
+}
+
+test_device_array() {
+	echo "Running ${TEST_NAME}"
+
+	if [[ ${#TEST_DEV_ARRAY[@]} -lt 4 ]]; then
+		SKIP_REASONS+=("requires at least 4 test devices")
+		return 1
+	fi
+
+	local level ndevs mddev
+
+	for level in $MD_RAID_LEVELS; do
+		echo "Testing raid${level}" >>"$FULL"
+
+		if ! _have_md_level "$level"; then
+			continue
+		fi
+
+		ndevs=$(_md_min_devices "$level")
+		mddev=$(_md_create_array "$level" "${TEST_DEV_ARRAY[@]:0:$ndevs}")
+
+		if ! _is_md_level "$mddev" "raid${level}"; then
+			echo "array is not raid${level}"
+			_md_detail "$mddev"
+		fi
+
+		if ! _md_status "$mddev"; then
+			echo "array did not reach a healthy state"
+			_md_detail "$mddev"
+		fi
+
+		_run_fio_verify_io --filename="$mddev" --size=128M
+
+		mdadm --quiet --stop "$mddev" >/dev/null 2>&1
+	done
+
+	echo "Test complete"
+}
