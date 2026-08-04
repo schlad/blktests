@@ -1,0 +1,90 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2026 Sebastian Chlad, SUSE
+#
+# Consistency-check sanity test: for each redundant raid level, create
+# an array on real block devices, write some data, then trigger mdadm's
+# "check" sync_action and verify it completes with zero mismatches.
+# Raid0 has no redundancy to check so it's excluded.
+
+. tests/md/rc
+
+DESCRIPTION="verify a raid array's consistency check reports no mismatches"
+QUICK=1
+
+requires() {
+	_have_fio
+
+	_require_md_raid
+}
+
+device_requires() {
+	_require_test_dev_size 512m
+}
+
+test_device_array() {
+	echo "Running ${TEST_NAME}"
+
+	if [[ ${#TEST_DEV_ARRAY[@]} -lt 4 ]]; then
+		SKIP_REASONS+=("requires at least 4 test devices")
+		return 1
+	fi
+
+	local level ndevs mddev sysfs_dir mismatch_cnt count
+
+	for level in $MD_RAID_LEVELS; do
+		[[ "$level" == 0 ]] && continue
+		echo "Testing raid${level}" >>"$FULL"
+
+		if ! _have_md_level "$level"; then
+			continue
+		fi
+
+		ndevs=$(_md_min_devices "$level")
+		mddev="/dev/md/blktests_md_${TEST_NAME##*/}"
+
+		# No --assume-clean: the check below scans the whole array, so
+		# it needs a real initial resync first, not just the small
+		# region _run_fio_verify_io touches. --size caps how much of
+		# each real device is used, since check/resync scan the whole
+		# array and would otherwise scale with the real device's full
+		# capacity instead of staying fast and predictable.
+		mdadm --create --run --quiet "$mddev" \
+			--level="$level" --raid-devices="$ndevs" --size=256M \
+			"${TEST_DEV_ARRAY[@]:0:$ndevs}"
+		udevadm settle
+
+		if ! timeout 300 mdadm --wait "$mddev"; then
+			echo "timed out waiting for raid${level} initial resync to finish"
+		fi
+
+		if ! _md_status "$mddev"; then
+			echo "raid${level} array did not reach a healthy state"
+			_md_detail "$mddev"
+		fi
+
+		_run_fio_verify_io --filename="$mddev" --size=64M
+
+		sysfs_dir=$(_md_sysfs_dir "$mddev")
+		echo check > "${sysfs_dir}/sync_action"
+
+		count=0
+		until [[ "$(<"${sysfs_dir}/sync_action")" == "idle" ]]; do
+			sleep 1
+			count=$((count + 1))
+			if ((count >= 300)); then
+				echo "timed out waiting for raid${level} consistency check to finish"
+				break
+			fi
+		done
+
+		mismatch_cnt=$(<"${sysfs_dir}/mismatch_cnt")
+		if [[ "$mismatch_cnt" != "0" ]]; then
+			echo "raid${level} consistency check found ${mismatch_cnt} mismatches"
+		fi
+
+		mdadm --quiet --stop "$mddev" >/dev/null 2>&1
+	done
+
+	echo "Test complete"
+}

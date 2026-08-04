@@ -199,6 +199,34 @@ least three devices, which can be specified in your configuration as follows:
 
 TEST_CASE_DEV_ARRAY[bcache/*]="/dev/nvme0n1 /dev/vdb /dev/vdc"
 
+### MD raid tests
+
+Most md tests are self-contained: they synthesize their own backing
+devices internally (nvme-tcp loopback, scsi_debug) and need no device
+configuration at all. The exceptions are tests that need real block
+devices, which use TEST_CASE_DEV_ARRAY the same way the bcache tests
+do. The raid sanity and degraded tests (`md/005`, `md/006`) need at
+least 4 devices, since raid6 and raid10 require 4. The rebuild test
+(`md/007`, which also runs a post-rebuild consistency check) needs a
+5th device, used as the replacement when it fails and rebuilds a
+member:
+
+```sh
+TEST_CASE_DEV_ARRAY[md/00[5-6]]="/dev/nvme0n1 /dev/vdb /dev/vdc /dev/vdd"
+TEST_CASE_DEV_ARRAY[md/007]="/dev/nvme0n1 /dev/vdb /dev/vdc /dev/vdd /dev/vde"
+```
+
+`md/005`-`md/007` can also be parameterized via an environment variable.
+
+- MD_RAID_LEVELS: '0 1 5 6 10' (default)
+  The raid levels iterated over in each test. A level whose personality
+  isn't available on the kernel is skipped individually rather than
+  skipping the whole test. Override to focus a run on specific level(s).
+
+```sh
+MD_RAID_LEVELS=5 ./check md/005
+```
+
 ### Normal user
 
 To run test cases which require normal user privilege, prepare a user and
