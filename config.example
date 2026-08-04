@@ -167,3 +167,15 @@
 #   Defaults to "nullb sdebug".
 #
 # THROTL_BLKDEV_TYPES="nullb sdebug"
+
+# ---------------------------------------------------------------------------
+# MD raid test parameters
+# ---------------------------------------------------------------------------
+
+# MD_RAID_LEVELS
+#   Space-separated list of raid levels for the md raid sanity, degraded,
+#   and rebuild tests (md/005-md/007) to iterate over.  A level whose
+#   personality isn't available on the kernel is skipped individually
+#   rather than skipping the whole test.  Defaults to "0 1 5 6 10".
+#
+# MD_RAID_LEVELS="0 1 5 6 10"

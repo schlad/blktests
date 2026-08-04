@@ -7,6 +7,8 @@
 . common/rc
 . common/xfs
 
+MD_RAID_LEVELS="${MD_RAID_LEVELS:-0 1 5 6 10}"
+
 group_requires() {
 	_have_root
 	_have_program mdadm
@@ -456,4 +458,149 @@ _md_atomics_test() {
 			fi
 		done
 	done
+}
+
+# Run mdadm --detail once for a diagnostic dump.
+# Args:    $1 - md device path (e.g. /dev/md/blktests_md_005)
+# Returns: Raw, human-readable mdadm --detail output.
+_md_detail() {
+	mdadm --detail "$1"
+}
+
+# Like _have_driver(), but no SKIP_REASONS side effect, so one missing
+# level doesn't skip a test that also covers others.
+# Args:    $1 - raid level (e.g. "0", "5", "10")
+# Returns: 0 if available, 1 otherwise.
+_have_md_level() {
+	local modname="raid$1"
+
+	[[ -d "/sys/module/${modname}" ]] || modprobe -q "${modname}"
+}
+
+# Checks the exact MD_LEVEL= line from mdadm --detail --export.
+# Args:    $1 - md device path (e.g. /dev/md/blktests_md_005)
+#          $2 - expected raid level (e.g. "raid0", "raid5")
+# Returns: 0 if the array is at the given level, 1 otherwise.
+_is_md_level() {
+	local device="$1" level="$2"
+
+	mdadm --detail --export "$device" | grep -qx "MD_LEVEL=${level}"
+}
+
+# Delegates to mdadm --detail --test's exit status. Not a strict
+# boolean: callers checking for a specific status (e.g.
+# _md_status_is_degraded) rely on the exact code.
+# Args:    $1 - md device path (e.g. /dev/md/blktests_md_005)
+# Returns: 0 ok, 1 degraded, 2 dead, 4 missing.
+_md_status() {
+	mdadm --detail --test "$1" >/dev/null
+}
+
+# Checks mdadm --detail --test's exit status specifically for 1
+# (degraded).
+# Args:    $1 - md device path (e.g. /dev/md/blktests_md_005)
+# Returns: 0 if degraded, 1 otherwise.
+_md_status_is_degraded() {
+	mdadm --detail --test "$1" >/dev/null
+	[[ $? -eq 1 ]]
+}
+
+# Checks if any device in the array currently shows as faulty.
+# Args:    $1 - md device path (e.g. /dev/md/blktests_md_005)
+# Returns: 0 if any device is faulty, 1 otherwise.
+_md_is_faulty() {
+	_md_detail "$1" | grep -q faulty
+}
+
+# Requires at least one raid personality in MD_RAID_LEVELS to be
+# available on this kernel.
+# Args:    None (reads MD_RAID_LEVELS)
+# Returns: 0 if at least one level is available, 1 otherwise (and sets
+#          SKIP_REASONS).
+_require_md_raid() {
+	local level
+
+	for level in $MD_RAID_LEVELS; do
+		_have_md_level "$level" && return 0
+	done
+	SKIP_REASONS+=("no configured md raid personality (${MD_RAID_LEVELS}) is available")
+	return 1
+}
+
+# Minimum device count for a raid level.
+# Args:    $1 - raid level (e.g. "0", "5", "10")
+# Returns: The minimum device count for that level.
+_md_min_devices() {
+	case "$1" in
+	0 | 1) echo 2 ;;
+	5) echo 3 ;;
+	6 | 10) echo 4 ;;
+	esac
+}
+
+# Creates a raid array of the given level on the given devices, waits
+# for udev to settle, and waits for the initial resync to finish.
+# Args:    $1   - raid level (e.g. "0", "5", "10")
+#          $2.. - member devices
+# Returns: The resulting md device path (e.g. /dev/md/blktests_md_005).
+_md_create_array() {
+	local level="$1"
+	shift
+	local mddev="/dev/md/blktests_md_${TEST_NAME##*/}"
+
+	mdadm --create --run --quiet "$mddev" \
+		--level="$level" --raid-devices="$#" --size=256M "$@"
+	udevadm settle
+
+	[[ "$level" != 0 ]] && timeout 300 mdadm --wait "$mddev"
+
+	echo "$mddev"
+}
+
+# Resolve an md device path/symlink to its sysfs md directory. Needed
+# for attributes mdadm --detail doesn't expose, like sync_action/
+# mismatch_cnt.
+# Args:    $1 - md device path (e.g. /dev/md/blktests_md_005)
+# Returns: The sysfs md directory (e.g. /sys/block/md127/md).
+_md_sysfs_dir() {
+	local dev
+	dev=$(readlink -f "$1")
+	echo "/sys/block/$(basename "$dev")/md"
+}
+
+# Returns the number of sectors written through an md device.
+# Args:    $1 - md device path (e.g. /dev/md/blktests_md_006)
+_md_sectors_written() {
+	local md_sysfs
+	local -a stats
+
+	md_sysfs=$(_md_sysfs_dir "$1") || return 1
+	read -r -a stats <"${md_sysfs%/md}/stat" || return 1
+
+	# /sys/class/block/<dev>/stat field 7, array index 6.
+	echo "${stats[6]}"
+}
+
+# Waits until an md device receives a write while its writer remains alive.
+# Args:    $1 - md device path
+#          $2 - initial sectors-written count
+#          $3 - background writer PID
+# Returns: 0 once a write is observed, 1 if the writer exits or on timeout.
+_wait_for_md_write() {
+	local mddev="$1" initial="$2" writer_pid="$3"
+	local current count
+
+	for ((count = 0; count < 50; count++)); do
+		kill -0 "$writer_pid" 2>/dev/null || return 1
+
+		current=$(_md_sectors_written "$mddev") || return 1
+		if ((current > initial)); then
+			kill -0 "$writer_pid" 2>/dev/null
+			return
+		fi
+
+		sleep 0.1
+	done
+
+	return 1
 }

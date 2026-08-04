@@ -1,0 +1,100 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2026 Sebastian Chlad, SUSE
+#
+# Rebuild sanity test: RAID 1, 5, 6, 10. For each of these redundant
+# raid levels, create an array on real block devices, write and verify
+# a baseline with fio, fail/remove one member and add a fifth, unused
+# device as its replacement to drive recovery, then verify the array is
+# healthy again and the data still checks out after rebuild. A genuine
+# replacement device is used instead of re-adding the failed one, since
+# a real rebuild replaces the failed disk rather than reinserting it.
+
+. tests/md/rc
+
+DESCRIPTION="verify a raid array recovers correctly after a rebuild"
+QUICK=1
+
+requires() {
+	_have_fio
+	_require_md_raid
+}
+
+device_requires() {
+	_require_test_dev_size 512m
+}
+
+test_device_array() {
+	echo "Running ${TEST_NAME}"
+
+	if [[ ${#TEST_DEV_ARRAY[@]} -lt 5 ]]; then
+		SKIP_REASONS+=("requires at least 5 test devices")
+		return 1
+	fi
+
+	local level ndevs mddev fail_dev spare_dev count
+
+	for level in $MD_RAID_LEVELS; do
+		[[ "$level" == 0 ]] && continue
+		echo "Testing raid${level}" >>"$FULL"
+
+		if ! _have_md_level "$level"; then
+			continue
+		fi
+
+		ndevs=$(_md_min_devices "$level")
+		mddev=$(_md_create_array "$level" "${TEST_DEV_ARRAY[@]:0:$ndevs}")
+		fail_dev="${TEST_DEV_ARRAY[1]}"
+		spare_dev="${TEST_DEV_ARRAY[$ndevs]}"
+
+		if ! _md_status "$mddev"; then
+			echo "raid${level} array did not reach a healthy state"
+			_md_detail "$mddev"
+		fi
+
+		_run_fio_verify_io --filename="$mddev" --size=64M
+
+		mdadm --quiet "$mddev" --fail "$fail_dev" >/dev/null 2>&1
+
+		count=0
+		until _md_is_faulty "$mddev"; do
+			sleep 1
+			count=$((count + 1))
+			if ((count >= 20)); then
+				echo "timed out waiting for raid${level} device to be marked faulty"
+				break
+			fi
+		done
+
+		mdadm --quiet "$mddev" --remove "$fail_dev" >/dev/null 2>&1
+		mdadm --quiet "$mddev" --add "$spare_dev" >/dev/null 2>&1
+
+		count=0
+		until grep -q "recovery" /proc/mdstat; do
+			sleep 1
+			count=$((count + 1))
+			if ((count >= 10)); then
+				echo "timed out waiting for raid${level} recovery to start"
+				break
+			fi
+		done
+
+		if ! timeout 300 mdadm --wait "$mddev"; then
+			echo "timed out waiting for raid${level} recovery to finish"
+		fi
+
+		if ! _md_status "$mddev"; then
+			echo "raid${level} array did not recover to a healthy state"
+			_md_detail "$mddev"
+		fi
+
+		# --verify_only re-checks the data from the baseline write
+		# above instead of writing (and verifying) fresh data, in order
+		# to confirm the pre-failure data survived the rebuild.
+		_run_fio_verify_io --filename="$mddev" --size=64M --verify_only
+
+		mdadm --quiet --stop "$mddev" >/dev/null 2>&1
+	done
+
+	echo "Test complete"
+}
